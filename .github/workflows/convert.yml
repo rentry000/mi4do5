@@ -1,0 +1,133 @@
+# Workflow name
+name: Update mihomo Rulesets (SSH)
+
+# Controls when the action will run
+on:
+  # Triggers the workflow at 00:00 UTC every day
+  schedule:
+    - cron: '0 0 * * *'
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  update:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+    # Maximum duration of the job
+    timeout-minutes: 360
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Step 1: Configure Git to use SSH
+      - name: Configure Git for SSH
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          git config --global url."git@github.com:".insteadOf "https://github.com/"
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global advice.addEmbeddedRepo false
+
+      # Step 2: Install the SSH private key for authentication
+      - name: Install SSH Key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.ACTIONS }}
+
+      # Step 3: Check out the repository using SSH
+      - name: Checkout repository via SSH
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history for all branches and tags
+          ssh-key: ${{ secrets.ACTIONS }}
+
+      # Step 4: Clean up any existing ruleset submodules or directories
+      - name: Clean existing rulesets
+        run: |
+          if [ -f .gitmodules ]; then
+            git submodule deinit -f mihomo_rulesets
+            git rm --cached mihomo_rulesets
+            rm -rf .git/modules/mihomo_rulesets
+          fi
+          rm -rf mihomo_rulesets
+          mkdir -p mihomo_rulesets
+
+      # Step 5: Set up the Python environment
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12.11'
+
+      # Step 6: Install Python dependencies
+      - name: Install dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3-pip wget
+          python3 -m pip install --upgrade pip
+          pip3 install aiofiles aiodns aiohttp beautifulsoup4 gitpython httpx \
+                       pyyaml python-magic requests tenacity tldextract tqdm \
+                       treq twisted urllib3
+
+      # Step 7: Download and install the mihomo binary
+      - name: Install mihomo
+        run: |
+          MI_HOME=/usr/local/bin
+          MI_VERSION=v1.19.12
+          wget -q https://github.com/MetaCubeX/mihomo/releases/download/${MI_VERSION}/mihomo-linux-amd64-v3-${MI_VERSION}.gz
+          gzip -d mihomo-linux-amd64-v3-${MI_VERSION}.gz
+          sudo mv mihomo-linux-amd64-v3-${MI_VERSION} ${MI_HOME}/mihomo
+          sudo chmod +x ${MI_HOME}/mihomo
+
+      # Step 8: Verify that mihomo is installed correctly
+      - name: Verify mihomo
+        run: mihomo -v
+
+      # Step 9: Check out a fresh copy of the repository into a specific directory
+      - name: Checkout repository for script execution
+        uses: actions/checkout@v3
+        with:
+          path: mi4do3 # Clone the repository to the 'mi4do3' directory
+
+      # Step 10: Run the Python script to generate new rulesets
+      - name: Generate rules
+        working-directory: ./mi4do3 # Set the working directory for the script
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Pass the token if the script needs it
+        run: |
+          python mihomo2_rulesets_generator.py
+          # Clean up embedded .git directory if it exists after generation
+          if [ -d "mihomo_rulesets/.git" ]; then
+            echo "Detected embedded Git repository, cleaning up..."
+            rm -rf mihomo_rulesets/.git
+          fi
+
+      # Step 11: Commit and push the generated changes
+      - name: Commit and push changes
+        run: |
+          # Pull the latest changes to avoid conflicts
+          git pull --rebase origin main
+
+          # Check if there are any changes to commit
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Detected file changes, preparing to commit..."
+            
+            # Add all changes to the staging area
+            git add -A
+            
+            # Specifically add the rulesets directory to ensure it's tracked
+            if [ -d "mihomo_rulesets" ]; then
+              git add mihomo_rulesets/
+            fi
+            
+            # Commit with a timestamp
+            TIMESTAMP=$(date +"%Y-%m-%d %H:%M:%S")
+            git commit -m "chore: Auto-update rulesets at ${TIMESTAMP}"
+            
+            # Force push the changes to the main branch
+            # Use with caution, as it can overwrite history.
+            git push origin HEAD:main --force
+          else
+            echo "No changes detected, skipping commit."
+          fi
